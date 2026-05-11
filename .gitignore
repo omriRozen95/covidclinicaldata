@@ -1,4 +1,37 @@
-.DS_Store
-.ipynb_checkpoints/
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
 
+# Virtual environments
 venv/
+env/
+.venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/__pycache__/
+
+# Environment variables
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution / packaging
+*.whl
