@@ -320,7 +320,14 @@ INDICATOR_SOURCE_COLS = [
     'er_referral',
 ]
 
-FEATURE_COLS = list(ENGINEERED_COLS)
+FEATURE_COLS = [
+    c for c in (
+        SYMPTOMS + VITALS + COMORBIDITIES + RISKS
+        + ENGINEERED_COLS
+        + CATEGORICAL_COLS
+    )
+    if c != 'er_referral'  # 0% prevalence in both classes — no signal
+]
 
 LOW_FILL_THRESHOLD = 0.10
 
@@ -361,7 +368,8 @@ def _build_X_y(data: pd.DataFrame):
         elif col in SEVERITY_COLS:
             X[col] = s.map(SEVERITY_MAPPINGS).astype(float)
         elif col in NUMERIC_COLS or col in ENGINEERED_COLS:
-            X[col] = s.astype(float)
+            # Via Float64 first: handles nullable Boolean/Int64 inputs (pd.NA → NaN).
+            X[col] = s.astype('Float64').astype(float)
         else:
             # Booleans — NaN preserved as NaN so trees can split on it
             X[col] = s.map({True: 1.0, False: 0.0})
