@@ -14,8 +14,11 @@ import seaborn as sns
 from scipy import stats
 from typing import List
 
+import optuna
+from xgboost import XGBClassifier
+
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 
 plt.style.use('fivethirtyeight')
 
@@ -55,6 +58,12 @@ SYMPTOMS = [
     'days_since_symptom_onset',
 ]
 
+# Symptom domain subsets used by the boolean-combo engineered features below.
+UPPER_RESP = ['runny_nose', 'sore_throat']
+LOWER_RESP = ['cough', 'sob', 'labored_respiration']
+CONSTITUTIONAL = ['fever', 'muscle_sore', 'fatigue', 'headache']
+SMELL_TASTE = ['loss_of_smell', 'loss_of_taste']
+
 VITALS = [
     'temperature',
     'pulse',
@@ -79,6 +88,7 @@ RISKS = [
     'age',
     'high_risk_exposure_occupation',
     'high_risk_interactions',
+    'er_referral',
 ]
 
 TEST_RESULTS = [
@@ -235,7 +245,7 @@ def keep_rows_with_any_filled(
 
 def get_color(col: str) -> str:
     """Return the palette color assigned to a column based on its feature group."""
-    if col in TEST_RESULTS:
+    if col in TEST_RESULTS or col in CATEGORICAL_COLS:
         return COLOR_PALETTE[0]
     if col in RISKS:
         return COLOR_PALETTE[1]
@@ -243,7 +253,7 @@ def get_color(col: str) -> str:
         return COLOR_PALETTE[2]
     if col in VITALS:
         return COLOR_PALETTE[3]
-    if col in SYMPTOMS:
+    if col in SYMPTOMS or col in ENGINEERED_COLS:
         return COLOR_PALETTE[4]
     if col in CXR_FIELDS:
         return COLOR_PALETTE[5]
@@ -291,78 +301,198 @@ def plot_fill_rates(data: pd.DataFrame, title: str = ''):
 
 SEVERITY_COLS = {'cough_severity', 'sob_severity'}
 NUMERIC_COLS = set(VITALS) | {'age', 'days_since_symptom_onset'}
-FEATURE_COLS = SYMPTOMS + VITALS + COMORBIDITIES + RISKS
+ENGINEERED_COLS = [
+    'num_symptoms', 'severity_score',
+    'anosmia_or_ageusia', 'anosmia_and_ageusia',
+    'constitutional_score', 'competing_dx_auscultation',
+    'upper_resp_only', 'covid_specific_pattern',
+    'organ_system_diversity',
+]
+CATEGORICAL_COLS = ['swab_type', 'test_name']
+
+# Columns where "value missing" is itself informative (sparse, high-signal fields).
+# A separate <col>_missing indicator is added so the model can branch on availability
+# even when XGBoost's native NaN handling already splits on missingness internally.
+INDICATOR_SOURCE_COLS = [
+    'temperature', 'pulse', 'rr', 'sats',
+    'days_since_symptom_onset',
+    'cough_severity', 'sob_severity',
+    'er_referral',
+]
+
+FEATURE_COLS = list(ENGINEERED_COLS)
 
 LOW_FILL_THRESHOLD = 0.10
 
 
 def _get_group_label(col: str) -> str:
-    if col in SYMPTOMS:      return 'Symptoms'
-    if col in VITALS:        return 'Vitals'
-    if col in COMORBIDITIES: return 'Comorbidities'
-    if col in RISKS:         return 'Epi Factors'
+    if col in SYMPTOMS:          return 'Symptoms'
+    if col in VITALS:            return 'Vitals'
+    if col in COMORBIDITIES:     return 'Comorbidities'
+    if col in RISKS:             return 'Epi Factors'
+    if col in ENGINEERED_COLS:   return 'Symptoms'
+    if col in CATEGORICAL_COLS:  return 'Test Results'
+    if col.endswith('_missing'): return 'Other'
     return 'Other'
 
 
 def _build_X_y(data: pd.DataFrame):
     """Encode features and labels for model training.
 
+    NaNs are preserved (cast to float) so XGBoost/LightGBM can branch on them
+    natively. Boolean True/False -> 1.0/0.0, severity strings -> ordinal 1/2/3,
+    categorical strings -> pandas Categorical (XGBoost ≥1.6 + enable_categorical).
+    Explicit <col>_missing indicators are added for high-signal sparse fields.
+
     Returns (X, y) filtered to rows where the label is non-null.
     """
-    X = data[FEATURE_COLS].copy()
+    df = data.copy()
+
+    # Engineered features — computed inline so notebook ordering doesn't matter.
+    df['num_symptoms'] = df[SYMPTOMS].eq(True).sum(axis=1)
+    df['severity_score'] = df.apply(get_symptom_severity_score, axis=1)
+    add_boolean_combo_features(df)
+
+    X = pd.DataFrame(index=df.index)
     for col in FEATURE_COLS:
-        if col in SEVERITY_COLS:
-            X[col] = X[col].map(SEVERITY_MAPPINGS).fillna(0).astype(int)
-        elif col in NUMERIC_COLS:
-            X[col] = X[col].fillna(X[col].median())
+        s = df[col]
+        if col in CATEGORICAL_COLS:
+            X[col] = s.astype('category')
+        elif col in SEVERITY_COLS:
+            X[col] = s.map(SEVERITY_MAPPINGS).astype(float)
+        elif col in NUMERIC_COLS or col in ENGINEERED_COLS:
+            X[col] = s.astype(float)
         else:
-            # NaN encoded as -1: "not recorded" is clinically distinct from False
-            X[col] = X[col].map({True: 1, False: 0}).fillna(-1).astype(int)
+            # Booleans — NaN preserved as NaN so trees can split on it
+            X[col] = s.map({True: 1.0, False: 0.0})
+
+    # Only add a <col>_missing indicator if the source column is in FEATURE_COLS.
+    # When FEATURE_COLS is restricted (e.g., engineered-only), this prevents raw
+    # columns from re-entering the model through their missingness flags.
+    for col in INDICATOR_SOURCE_COLS:
+        if col in FEATURE_COLS:
+            X[f'{col}_missing'] = data[col].isna().astype(int)
 
     y = (data[LABEL] == 'Positive').astype(int)
     mask = data[LABEL].notna()
     return X[mask].reset_index(drop=True), y[mask].reset_index(drop=True)
 
 
-def build_model(data: pd.DataFrame):
-    """Train a RandomForest on FEATURE_COLS and return (classifier, X_train, y_train, X_test, y_test, fill_rates)."""
-    fill_rates = {col: data[col].notna().mean() for col in FEATURE_COLS}
-    X, y = _build_X_y(data)
-    logging.info(f'Training RandomForest on {len(y)} rows, {y.sum()} positives ({y.mean():.1%})')
+def build_model(
+    data: pd.DataFrame,
+    n_trials: int = 200,
+    model_type: str = 'xgboost',
+):
+    """Train a gradient-boosting classifier on FEATURE_COLS with Optuna search.
 
-    X_train, X_test, y_train, y_test = train_test_split(
+    Splits are 60/20/20 train/val/test (stratified). Optuna optimises PR-AUC
+    (`average_precision`) — threshold-free and robust to class imbalance — over
+    a wider search space than the original (gamma, reg_alpha, reg_lambda, and
+    scale_pos_weight all tunable). The validation set is returned separately so
+    the caller can pick an operating threshold without leaking test data.
+
+    model_type:
+        'xgboost'  — XGBClassifier with enable_categorical=True, tree_method='hist'
+        'lightgbm' — LGBMClassifier (lazy import; install lightgbm if needed)
+
+    Returns (classifier, X_train, y_train, X_val, y_val, X_test, y_test, fill_rates).
+    """
+    fill_rates = {col: data[col].notna().mean() for col in FEATURE_COLS if col in data.columns}
+    X, y = _build_X_y(data)
+
+    n_neg = int((y == 0).sum())
+    n_pos = int((y == 1).sum())
+    spw_max = max(round(n_neg / n_pos), 1)
+    logging.info(
+        f'Training {model_type} on {len(y)} rows, {n_pos} positives '
+        f'({y.mean():.1%}) — scale_pos_weight tunable up to {spw_max}'
+    )
+
+    # 60/20/20 train / val / test, stratified.
+    X_tv, X_test, y_tv, y_test = train_test_split(
         X, y, test_size=0.2, stratify=y, random_state=42
     )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tv, y_tv, test_size=0.25, stratify=y_tv, random_state=42
+    )
     logging.info(
-        f'Train: {len(y_train)} rows, {y_train.sum()} positives | '
-        f'Test: {len(y_test)} rows, {y_test.sum()} positives'
+        f'Train: {len(y_train)} ({y_train.sum()} pos) | '
+        f'Val: {len(y_val)} ({y_val.sum()} pos) | '
+        f'Test: {len(y_test)} ({y_test.sum()} pos)'
     )
 
-    classifier = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=10,
-        min_samples_leaf=5,
-        class_weight='balanced',
-        random_state=42,
-        n_jobs=-1,
-    )
+    if model_type == 'lightgbm':
+        from lightgbm import LGBMClassifier
+        Estimator = LGBMClassifier
+        fixed_params = {
+            'objective':    'binary',
+            'random_state': 42,
+            'n_jobs':       1,
+            'verbose':      -1,
+        }
+    else:
+        Estimator = XGBClassifier
+        fixed_params = {
+            'eval_metric':        'aucpr',
+            'random_state':       42,
+            'n_jobs':             1,
+            'enable_categorical': True,
+            'tree_method':        'hist',
+        }
+
+    def objective(trial):
+        params = {
+            'n_estimators':     trial.suggest_int('n_estimators', 100, 1500),
+            'max_depth':        trial.suggest_int('max_depth', 3, 10),
+            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample':        trial.suggest_float('subsample', 0.6, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+            'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+            'reg_alpha':        trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+            'reg_lambda':       trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+            'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, float(spw_max), log=True),
+            **fixed_params,
+        }
+        # gamma (XGB) / min_split_gain (LGBM) — same concept, different name.
+        if model_type == 'lightgbm':
+            params['min_split_gain'] = trial.suggest_float('min_split_gain', 0.0, 5.0)
+        else:
+            params['gamma'] = trial.suggest_float('gamma', 0.0, 5.0)
+
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        scores = cross_val_score(
+            Estimator(**params), X_train, y_train,
+            cv=cv, scoring='average_precision', n_jobs=-1,
+        )
+        return scores.mean()
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+    logging.info(f'Best Optuna trial — PR-AUC: {study.best_value:.4f}, params: {study.best_params}')
+
+    best_params = {**study.best_params, **fixed_params, 'n_jobs': -1}
+    classifier = Estimator(**best_params)
     classifier.fit(X_train, y_train)
     logging.info('Training complete.')
-    return classifier, X_train, y_train, X_test, y_test, fill_rates
+    return classifier, X_train, y_train, X_val, y_val, X_test, y_test, fill_rates
 
 
-def compute_feature_importance(classifier: RandomForestClassifier, X: pd.DataFrame, fill_rates: dict) -> pd.DataFrame:
+def compute_feature_importance(classifier, X: pd.DataFrame, fill_rates: dict) -> pd.DataFrame:
     """
-    Extract MDI feature importances from a trained RandomForest.
+    Extract feature importances from a trained tree ensemble (XGBoost / LightGBM /
+    RandomForest). Feature names are taken from X.columns so that engineered
+    columns and <col>_missing indicators are included.
 
     Returns a DataFrame with columns: feature, importance, fill_rate, group,
     sorted descending by importance.
     """
+    feature_names = list(X.columns)
     result = pd.DataFrame({
-        'feature': FEATURE_COLS,
+        'feature': feature_names,
         'importance': classifier.feature_importances_,
-        'fill_rate': [fill_rates[c] for c in FEATURE_COLS],
-        'group': [_get_group_label(c) for c in FEATURE_COLS],
+        'fill_rate': [fill_rates.get(c, float('nan')) for c in feature_names],
+        'group': [_get_group_label(c) for c in feature_names],
     }).sort_values('importance', ascending=False).reset_index(drop=True)
 
     logging.info('Top 5 features:\n' + result.head().to_string(index=False))
@@ -469,11 +599,12 @@ def compute_shap_importance(
 
     mean_abs_shap = np.abs(sv).mean(axis=0)
 
+    feature_names = list(X.columns)
     result = pd.DataFrame({
-        'feature': FEATURE_COLS,
+        'feature': feature_names,
         'importance': mean_abs_shap,
-        'fill_rate': [fill_rates[c] for c in FEATURE_COLS],
-        'group': [_get_group_label(c) for c in FEATURE_COLS],
+        'fill_rate': [fill_rates.get(c, float('nan')) for c in feature_names],
+        'group': [_get_group_label(c) for c in feature_names],
     }).sort_values('importance', ascending=False).reset_index(drop=True)
 
     logging.info('Top 5 SHAP features:\n' + result.head().to_string(index=False))
@@ -647,3 +778,67 @@ def get_sym_severity(score: int) -> str:
         return 'Moderate'
     else:
         return 'Severe'
+
+# ---------------------------------------------------------------------------
+# Boolean-combo engineered features
+#
+# Each builder takes the full dataframe and returns a Series. They are
+# combined by add_boolean_combo_features() and are also recomputed inline
+# inside _build_X_y so model training does not depend on notebook ordering.
+# NaN booleans collapse to False under .eq(True) — the same convention used
+# by the existing num_symptoms feature.
+# ---------------------------------------------------------------------------
+
+def _any_true(df: pd.DataFrame, cols: List[str]) -> pd.Series:
+    """Vectorized OR across cols, treating NaN as False (matches num_symptoms)."""
+    return df[cols].eq(True).any(axis=1)
+
+
+def get_anosmia_or_ageusia(df: pd.DataFrame) -> pd.Series:
+    return _any_true(df, SMELL_TASTE)
+
+
+def get_anosmia_and_ageusia(df: pd.DataFrame) -> pd.Series:
+    return df['loss_of_smell'].eq(True) & df['loss_of_taste'].eq(True)
+
+
+def get_constitutional_score(df: pd.DataFrame) -> pd.Series:
+    return df[CONSTITUTIONAL].eq(True).sum(axis=1)
+
+
+def get_competing_dx_auscultation(df: pd.DataFrame) -> pd.Series:
+    return df['rhonchi'].eq(True) | df['wheezes'].eq(True)
+
+
+def get_upper_resp_only(df: pd.DataFrame) -> pd.Series:
+    """Common-cold pattern: upper-resp symptoms without systemic/COVID-specific signals."""
+    upper = _any_true(df, UPPER_RESP)
+    specific = _any_true(df, SMELL_TASTE + ['fever', 'cough'])
+    return upper & ~specific
+
+
+def get_covid_specific_pattern(df: pd.DataFrame) -> pd.Series:
+    """Strongest per-case discriminators paired with the most prevalent positive symptom."""
+    return _any_true(df, SMELL_TASTE + ['fever']) & df['cough'].eq(True)
+
+
+def get_organ_system_diversity(df: pd.DataFrame) -> pd.Series:
+    """Count of distinct symptom domains present (0–4): upper-resp, lower-resp, constitutional, smell/taste."""
+    return (
+        _any_true(df, UPPER_RESP).astype(int)
+        + _any_true(df, LOWER_RESP).astype(int)
+        + _any_true(df, CONSTITUTIONAL).astype(int)
+        + _any_true(df, SMELL_TASTE).astype(int)
+    )
+
+
+def add_boolean_combo_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach the seven boolean-combo engineered features to df in place and return it."""
+    df['anosmia_or_ageusia']        = get_anosmia_or_ageusia(df)
+    df['anosmia_and_ageusia']       = get_anosmia_and_ageusia(df)
+    df['constitutional_score']      = get_constitutional_score(df)
+    df['competing_dx_auscultation'] = get_competing_dx_auscultation(df)
+    df['upper_resp_only']           = get_upper_resp_only(df)
+    df['covid_specific_pattern']    = get_covid_specific_pattern(df)
+    df['organ_system_diversity']    = get_organ_system_diversity(df)
+    return df

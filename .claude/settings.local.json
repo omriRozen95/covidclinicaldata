@@ -3,7 +3,15 @@
     "allow": [
       "Bash(python -c \"import sys,json; nb=json.load\\(sys.stdin\\); [print\\(c['source']\\) for c in nb['cells'] if 'plot_fill_rates' in ''.join\\(c['source']\\)]\")",
       "Bash(python -c \"import json; nb=json.load\\(open\\(r'c:\\\\Users\\\\somry\\\\Projects\\\\covidclinicaldata\\\\notebooks\\\\b_load_plot.ipynb'\\)\\); [print\\(i, c['source']\\) for i,c in enumerate\\(nb['cells']\\)]\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "PowerShell(Get-ChildItem -Recurse -Exclude venv -File | Where-Object {$_.Extension -in '.py', '.ipynb'} | Where-Object {$_.FullName -notmatch 'venv'} | Select-Object FullName)",
+      "Bash(xargs ls -lh)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\somry\\\\Projects\\\\covidclinicaldata\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(head -50)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c \"import sklearn; print\\(sklearn.__version__\\)\")",
+      "Bash(venv\\\\Scripts\\\\python.exe -c \"import sklearn; print\\('sklearn:', sklearn.__version__\\); import pandas; print\\('pandas:', pandas.__version__\\); import numpy; print\\('numpy:', numpy.__version__\\)\")"
     ]
   }
 }

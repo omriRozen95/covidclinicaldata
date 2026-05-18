@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push *)",
+      "Bash(pip show *)",
+      "Bash(cat requirements.txt)",
+      "Bash(cat setup.py)",
+      "Bash(python -c \"import json; nb=json.load\\(open\\('notebooks/b_load_plot.ipynb'\\)\\); [print\\(f'=== Cell {i} ===\\\\n'+\\(''.join\\(c['source']\\)\\)[:2000]+'\\\\n'\\) for i,c in enumerate\\(nb['cells']\\) if i >= 9 and i <= 12]\")",
+      "Bash(.\\\\venv\\\\Scripts\\\\python.exe -m pip install \"xgboost>=2.0\" optuna)"
+    ]
+  }
+}

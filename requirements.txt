@@ -32,6 +32,9 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 pyzmq==27.1.0
 scikit-learn==1.8.0
+xgboost>=2.0
+lightgbm
+optuna
 shap
 scipy==1.17.1
 seaborn==0.13.2
